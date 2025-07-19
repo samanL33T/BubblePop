@@ -19,9 +19,16 @@ Bubble.io applications use Elasticsearch for data operations, but encrypt the qu
 2. Enter the target Bubble.io app name 
 3. Click Save
 
+<img width="615" height="212" alt="image" src="https://github.com/user-attachments/assets/e61d7c2a-53b4-4652-b6dd-02c9d1dad3e0" />
+
 ## Usage
 
 Once configured, browse to your target Bubble.io application. When Burp intercepts encrypted Elasticsearch requests, you'll see a new "BubblePop" tab in the Proxy/Repeater that shows the decrypted database queries and JSON data. You can edit these queries and send modified requests - the extension handles re-encryption automatically.
+
+<img width="1037" height="491" alt="image" src="https://github.com/user-attachments/assets/74bfc748-b384-46b1-993c-740e354e22b4" />
+
+<img width="478" height="257" alt="image" src="https://github.com/user-attachments/assets/dd45247d-50a1-4e09-8655-53150de65883" />
+
 
 ## Credits
 
