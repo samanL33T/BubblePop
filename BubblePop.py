@@ -1,36 +1,56 @@
 # BubblePop - Burp Suite Extension for Bubble.io Payload Decryption
 
-from burp import IBurpExtender, IHttpListener, IMessageEditorTabFactory, IMessageEditorTab, ITab
+from burp import IBurpExtender, IHttpListener, IMessageEditorTabFactory, IMessageEditorTab, ITab, IExtensionStateListener
 from java.awt import BorderLayout, FlowLayout
-from javax.swing import JPanel, JLabel, JTextField, JButton, JScrollPane, JTextArea, ScrollPaneConstants
+from javax.swing import JPanel, JLabel, JTextField, JButton, JScrollPane, JTextArea, ScrollPaneConstants, SwingUtilities
 from javax.crypto import Cipher, Mac
 from javax.crypto.spec import SecretKeySpec, IvParameterSpec
 from java.security import MessageDigest
 from java.util import Base64
-from java.lang import String
+from java.lang import String, Thread, Runnable
+from java.util.concurrent import ExecutorService, Executors, TimeUnit
+from java.util.concurrent.locks import ReentrantReadWriteLock
 import json
 import array
 
-class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory, ITab):
+class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory, ITab, IExtensionStateListener):
     
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
         self._app_name = ""
+        self._executor = Executors.newFixedThreadPool(2)
+        self._app_name_lock = ReentrantReadWriteLock()
+        self._active_tabs = []
         
         callbacks.setExtensionName("BubblePop")
         callbacks.registerHttpListener(self)
         callbacks.registerMessageEditorTabFactory(self)
+        callbacks.registerExtensionStateListener(self)
         
         # Create UI
         self.create_ui()
         
+        # Add to Burp UI
+        callbacks.addSuiteTab(self)
+        
         print("BubblePop Extension loaded successfully")
+
+    def extensionUnloaded(self):
+        try:
+            if hasattr(self, '_executor') and self._executor:
+                self._executor.shutdown()
+                try:
+                    if not self._executor.awaitTermination(5, TimeUnit.SECONDS):
+                        self._executor.shutdownNow()
+                except Exception:
+                    self._executor.shutdownNow()
+        except Exception as e:
+            print("BubblePop: Error during cleanup: " + str(e))
     
     def create_ui(self):
         self._main_panel = JPanel(BorderLayout())
         
-        # Configuration panel
         config_panel = JPanel(FlowLayout())
         config_panel.add(JLabel("Bubble.io App Name:"))
         
@@ -42,29 +62,66 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory, ITab)
         
         self._main_panel.add(config_panel, BorderLayout.NORTH)
         
-        # Status panel
         status_panel = JPanel(FlowLayout())
         status_panel.add(JLabel("Bubble.io payload decryption and re-encryption"))
         self._main_panel.add(status_panel, BorderLayout.CENTER)
-        
-        # Add to Burp UI
-        self._callbacks.addSuiteTab(self)
     
     def save_config(self, event):
-        self._app_name = self._app_name_field.getText().strip()
+        write_lock = self._app_name_lock.writeLock()
+        write_lock.lock()
+        try:
+            old_app_name = self._app_name
+            self._app_name = self._app_name_field.getText().strip()
+            print("BubblePop: App name configured: " + self._app_name)
+            
+            if old_app_name != self._app_name:
+                self.clear_all_tabs()
+        finally:
+            write_lock.unlock()
+
+    def clear_all_tabs(self):
+        for tab in self._active_tabs[:]:
+            try:
+                tab.clear_content()
+            except Exception:
+                pass
+
+    def get_app_name_safely(self):
+        read_lock = self._app_name_lock.readLock()
+        read_lock.lock()
+        try:
+            return self._app_name
+        finally:
+            read_lock.unlock()
     
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
-        if not messageIsRequest or not self._app_name:
+        if not messageIsRequest:
+            return
+            
+        read_lock = self._app_name_lock.readLock()
+        read_lock.lock()
+        try:
+            current_app_name = self._app_name
+        finally:
+            read_lock.unlock()
+            
+        if not current_app_name:
             return
         
         request = messageInfo.getRequest()
         body = self.get_request_body(request)
         
         if body and self.is_bubble_payload(body):
+            def process_request():
+                try:
+                    self.decrypt_payload(body)
+                except Exception as e:
+                    print("BubblePop: Decryption error: " + str(e))
+            
             try:
-                self.decrypt_payload(body)
+                self._executor.submit(process_request)
             except Exception as e:
-                print("BubblePop: Decryption error: " + str(e))
+                print("BubblePop: Failed to submit background task: " + str(e))
     
     def get_request_body(self, request):
         request_info = self._helpers.analyzeRequest(request)
@@ -77,7 +134,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory, ITab)
         try:
             data = json.loads(body)
             return isinstance(data, dict) and 'x' in data and 'y' in data and 'z' in data
-        except:
+        except Exception:
             return False
     
     def pbkdf2_hmac_md5(self, password_bytes, salt_bytes, iterations, dklen):
@@ -94,10 +151,10 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory, ITab)
                 mac.update(salt_bytes)
                 
                 int_bytes = array.array('b')
-                int_bytes.append(((block_count >> 24) & 0xFF) if ((block_count >> 24) & 0xFF) < 128 else ((block_count >> 24) & 0xFF) - 256)
-                int_bytes.append(((block_count >> 16) & 0xFF) if ((block_count >> 16) & 0xFF) < 128 else ((block_count >> 16) & 0xFF) - 256) 
-                int_bytes.append(((block_count >> 8) & 0xFF) if ((block_count >> 8) & 0xFF) < 128 else ((block_count >> 8) & 0xFF) - 256)
-                int_bytes.append((block_count & 0xFF) if (block_count & 0xFF) < 128 else (block_count & 0xFF) - 256)
+                for shift in [24, 16, 8, 0]:
+                    byte_val = (block_count >> shift) & 0xFF
+                    signed_byte = byte_val if byte_val < 128 else byte_val - 256
+                    int_bytes.append(signed_byte)
                 mac.update(int_bytes.tostring())
                 
                 u_prev = mac.doFinal()
@@ -248,21 +305,50 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory, ITab)
     
     def decrypt_payload_with_metadata(self, body):
         try:
+            if not body:
+                self._log_error("Empty body data provided for decryption")
+                return None, None, None, None
+                
+            try:
+                if hasattr(body, 'toString'):
+                    body = body.toString()
+                else:
+                    body = str(body)
+            except Exception:
+                self._log_error("Failed to convert body to string")
+                return None, None, None, None
+                
             data = json.loads(body)
             
+            required_fields = ['x', 'y', 'z']
+            for field in required_fields:
+                if field not in data or not data[field]:
+                    self._log_error("Missing or empty required field: " + field)
+                    return None, None, None, None
+            
             y_data = data['y']
-            x_data = data['x']
+            x_data = data['x'] 
             z_data = data['z']
             
-            timestamp_string = self.decrypt_with_fixed_iv(y_data, self._app_name, "po9")
-            iv_string = self.decrypt_with_fixed_iv(x_data, self._app_name, "fl1")
+            current_app_name = self.get_app_name_safely()
+            if not current_app_name:
+                self._log_error("App name not configured")
+                return None, None, None, None
+            
+            timestamp_string = self.decrypt_with_fixed_iv(y_data, current_app_name, "po9")
+            iv_string = self.decrypt_with_fixed_iv(x_data, current_app_name, "fl1")
             
             if not timestamp_string or not iv_string:
-                return "Failed to decrypt timestamp or IV"
+                self._log_error("Failed to decrypt timestamp or IV")
+                return None, None, None, None
             
-            encrypted_data = Base64.getDecoder().decode(z_data)
+            try:
+                encrypted_data = Base64.getDecoder().decode(z_data)
+            except Exception as b64_error:
+                self._log_error("Base64 decode error: " + str(b64_error))
+                return None, None, None, None
             
-            key_string = self._app_name + timestamp_string
+            key_string = current_app_name + timestamp_string
             key_string_bytes = String(key_string).getBytes("UTF-8")
             
             key_bytes_list = []
@@ -274,7 +360,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory, ITab)
                     key_bytes_list.append(b)
             
             key_bytes = array.array('b', key_bytes_list).tostring()
-            salt_bytes = String(self._app_name).getBytes("UTF-8")
+            salt_bytes = String(current_app_name).getBytes("UTF-8")
             
             derived_key_array = self.pbkdf2_hmac_md5(key_bytes, salt_bytes, 7, 32)
             
@@ -282,7 +368,8 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory, ITab)
             derived_iv_array = self.pbkdf2_hmac_md5(iv_string_bytes, salt_bytes, 7, 16)
             
             if not derived_key_array or not derived_iv_array:
-                return "Key derivation failed"
+                self._log_error("Key derivation failed")
+                return None, None, None, None
             
             derived_key = self.convert_to_java_bytes(derived_key_array)
             derived_iv = self.convert_to_java_bytes(derived_iv_array)
@@ -295,26 +382,41 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory, ITab)
             try:
                 decrypted = cipher.doFinal(encrypted_data)
             except Exception as aes_error:
-                return "AES decryption error: " + str(aes_error)
+                self._log_error("AES decryption error: " + str(aes_error))
+                return None, None, None, None
             
             decrypted_unpadded = self.remove_pkcs7_padding(decrypted)
             result = self.bytes_to_utf8_string(decrypted_unpadded)
             
+            if not result or len(result.strip()) == 0:
+                self._log_error("Decryption produced empty result")
+                return None, None, None, None
+            
             return result, timestamp_string, iv_string, data
             
-        except Exception as e:
-            print("BubblePop: Decryption failed: " + str(e))
+        except json.JSONDecodeError as json_error:
+            self._log_error("JSON parsing error: " + str(json_error))
             return None, None, None, None
+        except Exception as e:
+            self._log_error("Decryption failed: " + str(e))
+            return None, None, None, None
+
+    def _log_error(self, message):
+        print("BubblePop: " + message)
+
+    def _log_output(self, message):
+        print("BubblePop: " + message)
     
     def encrypt_payload(self, plaintext, timestamp_string, iv_string):
         try:
-            if not plaintext or not timestamp_string or not iv_string or not self._app_name:
-                print("BubblePop: Missing required data for encryption")
+            current_app_name = self.get_app_name_safely()
+            if not plaintext or not timestamp_string or not iv_string or not current_app_name:
+                self._log_error("Missing required data for encryption")
                 return None
             
-            print("BubblePop: Re-encrypting modified payload...")
+            self._log_output("Re-encrypting modified payload...")
             
-            key_string = self._app_name + timestamp_string
+            key_string = current_app_name + timestamp_string
             key_bytes = String(key_string).getBytes("UTF-8")
             
             cleaned_key = []
@@ -328,14 +430,14 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory, ITab)
             key_array = array.array('b', [b if b < 128 else b - 256 for b in cleaned_key])
             key_for_pbkdf2 = key_array.tostring()
             
-            salt_bytes = String(self._app_name).getBytes("UTF-8")
+            salt_bytes = String(current_app_name).getBytes("UTF-8")
             iv_string_bytes = String(iv_string).getBytes("UTF-8")
             
             derived_key_array = self.pbkdf2_hmac_md5(key_for_pbkdf2, salt_bytes, 7, 32)
             derived_iv_array = self.pbkdf2_hmac_md5(iv_string_bytes, salt_bytes, 7, 16)
             
             if not derived_key_array or not derived_iv_array:
-                print("BubblePop: PBKDF2 key/IV derivation failed")
+                self._log_error("PBKDF2 key/IV derivation failed")
                 return None
             
             derived_key = self.convert_to_java_bytes(derived_key_array)
@@ -352,11 +454,11 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory, ITab)
             encrypted = cipher.doFinal(padded_data)
             encrypted_b64 = Base64.getEncoder().encodeToString(encrypted)
             
-            print("BubblePop: Re-encryption successful")
+            self._log_output("Re-encryption successful")
             return encrypted_b64
             
         except Exception as e:
-            print("BubblePop: Encryption error: " + str(e))
+            self._log_error("Encryption error: " + str(e))
             return None
     
     def add_pkcs7_padding(self, data):
@@ -440,7 +542,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory, ITab)
             
             try:
                 return raw_string.encode('iso-8859-1').decode('utf-8')
-            except:
+            except Exception:
                 return raw_string
                 
         except Exception as e:
@@ -448,14 +550,38 @@ class BurpExtender(IBurpExtender, IHttpListener, IMessageEditorTabFactory, ITab)
             return str(byte_array)
     
     def createNewInstance(self, controller, editable):
-        return BubbleDecryptorTab(self, controller, editable)
+        tab = BubbleDecryptorTab(self, controller, editable)
+        self._active_tabs.append(tab)
+        return tab
     
-    # Required for ISuiteTab interface
     def getTabCaption(self):
         return "BubblePop"
     
     def getUiComponent(self):
         return self._main_panel
+
+class DecryptionTask(Runnable):
+    def __init__(self, extender, body, callback):
+        self._extender = extender
+        self._body = body
+        self._callback = callback
+
+    def run(self):
+        try:
+            result = self._extender.decrypt_payload_with_metadata(self._body)
+            SwingUtilities.invokeLater(UpdateUITask(self._callback, result))
+        except Exception as e:
+            print("BubblePop: Decryption task error: " + str(e))
+
+
+class UpdateUITask(Runnable):
+    def __init__(self, callback, result):
+        self._callback = callback
+        self._result = result
+
+    def run(self):
+        self._callback(self._result)
+
 
 class BubbleDecryptorTab(IMessageEditorTab):
     def __init__(self, extender, controller, editable):
@@ -487,14 +613,13 @@ class BubbleDecryptorTab(IMessageEditorTab):
         return self._scroll_pane
     
     def isEnabled(self, content, isRequest):
-        # Only show for requests with configured app name
         if not isRequest or not self._extender._app_name:
             return False
         
         try:
             body = self._extender.get_request_body(content)
             return body and self._extender.is_bubble_payload(body)
-        except:
+        except Exception:
             return False
     
     def setMessage(self, content, isRequest):
@@ -511,39 +636,42 @@ class BubbleDecryptorTab(IMessageEditorTab):
         try:
             body = self._extender.get_request_body(content)
             if body and self._extender.is_bubble_payload(body):
-                result = self._extender.decrypt_payload_with_metadata(body)
-                if result[0] and len(result[0].strip()) > 0:
-                    decrypted, timestamp_string, iv_string, original_payload = result
-                    
-                    self._timestamp_string = timestamp_string
-                    self._iv_string = iv_string
-                    self._original_payload = original_payload
-                    
-                    try:
-                        import json
-                        json_data = json.loads(decrypted)
-                        formatted_json = json.dumps(json_data, indent=2)
-                        self._text_area.setText(formatted_json)
-                        self._original_text = formatted_json
-                        print("BubblePop: Payload decryption successful")
-                    except:
-                        self._text_area.setText(decrypted)
-                        self._original_text = decrypted
-                        print("BubblePop: Payload decryption successful")
-                    
-                    self._text_area.setCaretPosition(0)
-                else:
-                    self._text_area.setText("Decryption failed - check console for details")
-                    print("BubblePop: Payload decryption failed")
-                    self._timestamp_string = None
-                    self._iv_string = None
-                    self._original_payload = None
-                    self._original_text = None
+                task = DecryptionTask(self._extender, body, self._handle_decryption_result)
+                self._extender._executor.submit(task)
             else:
                 self._text_area.setText("")
         except Exception as e:
             self._text_area.setText("Error: " + str(e))
             print("BubblePop: Tab error: " + str(e))
+
+    def _handle_decryption_result(self, result):
+        if result and result[0] and len(result[0].strip()) > 0:
+            decrypted, timestamp_string, iv_string, original_payload = result
+            
+            self._timestamp_string = timestamp_string
+            self._iv_string = iv_string
+            self._original_payload = original_payload
+            
+            try:
+                import json
+                json_data = json.loads(decrypted)
+                formatted_json = json.dumps(json_data, indent=2)
+                self._text_area.setText(formatted_json)
+                self._original_text = formatted_json
+                print("BubblePop: Payload decryption successful")
+            except Exception:
+                self._text_area.setText(decrypted)
+                self._original_text = decrypted
+                print("BubblePop: Payload decryption successful")
+            
+            self._text_area.setCaretPosition(0)
+        else:
+            self._text_area.setText("Decryption failed - check console for details")
+            print("BubblePop: Payload decryption failed")
+            self._timestamp_string = None
+            self._iv_string = None
+            self._original_payload = None
+            self._original_text = None
     
     def getMessage(self):
         if not self._editable or not self._current_message:
@@ -619,3 +747,10 @@ class BubbleDecryptorTab(IMessageEditorTab):
     def getSelectedData(self):
         selected = self._text_area.getSelectedText()
         return selected.getBytes() if selected else None
+
+    def clear_content(self):
+        self._text_area.setText("")
+        self._timestamp_string = None
+        self._iv_string = None
+        self._original_payload = None
+        self._original_text = None
